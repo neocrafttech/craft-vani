@@ -1,0 +1,7 @@
+app.craftvani.in {
+    reverse_proxy frontend:80
+}
+
+api.craftvani.in {
+    reverse_proxy backend:3000
+}

@@ -1,42 +1,22 @@
-use js_sys::Date;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{AudioContext, AudioContextOptions, MediaStream, ScriptProcessorNode};
+use web_sys::{
+    AudioContext, AudioContextOptions, BinaryType, MediaStream, ScriptProcessorNode, WebSocket,
+};
 use yew::{Component, Context, Html, html};
-use yew_agent::{Bridge, Bridged};
 
-use crate::console_log;
-use crate::worker::{ModelData, Segment, Worker, WorkerInput, WorkerOutput};
+use inference::console_log;
+use inference::{InferenceOutput, Segment};
 
-async fn fetch_url(url: &str) -> Result<Vec<u8>, JsValue> {
-    use web_sys::{Request, RequestCache, RequestInit, RequestMode, Response};
-    let window = web_sys::window().ok_or("window")?;
-    let opts = RequestInit::new();
-    opts.set_method("GET");
-    opts.set_mode(RequestMode::Cors);
-    opts.set_cache(RequestCache::NoCache);
-    let request = Request::new_with_str_and_init(url, &opts)?;
-
-    let resp_value = JsFuture::from(window.fetch_with_request(&request)).await?;
-
-    // `resp_value` is a `Response` object.
-    assert!(resp_value.is_instance_of::<Response>());
-    let resp: Response = resp_value.dyn_into()?;
-    let data = JsFuture::from(resp.blob()?).await?;
-    let blob = web_sys::Blob::from(data);
-    let array_buffer = JsFuture::from(blob.array_buffer()).await?;
-    let data = js_sys::Uint8Array::new(&array_buffer).to_vec();
-    Ok(data)
-}
+// fetch_url is no longer needed as model loading moved to backend
 
 pub enum Msg {
     UpdateStatus(String),
-    SetDecoder(ModelData),
-    WorkerIn(WorkerInput),
-    WorkerOut(Result<WorkerOutput, String>),
+    WsOut(Result<InferenceOutput, String>),
     ToggleMute,
     RecordingStarted(Result<RecordingState, String>),
     Process,
+    WsConnected(WebSocket),
 }
 
 pub struct RecordingState {
@@ -55,58 +35,14 @@ pub struct CurrentDecode {
 
 pub struct App {
     status: String,
-    loaded: bool,
     segments: Vec<Segment>,
     current_decode: Option<CurrentDecode>,
-    worker: Box<dyn Bridge<Worker>>,
+    ws: Option<WebSocket>,
     recording: Option<RecordingState>,
     muted: bool,
     _interval: Option<gloo_timers::callback::Interval>,
     decoded_samples: usize,
-}
-
-async fn model_data_load() -> Result<ModelData, JsValue> {
-    let quantized = false;
-    let is_multilingual = false;
-
-    let (tokenizer, mel_filters, weights, config) = if quantized {
-        console_log!("loading quantized weights");
-        let tokenizer = fetch_url("quantized/tokenizer-tiny-en.json").await?;
-        let mel_filters = fetch_url("mel_filters.safetensors").await?;
-        let weights = fetch_url("quantized/model-tiny-en-q80.gguf").await?;
-        let config = fetch_url("quantized/config-tiny-en.json").await?;
-        (tokenizer, mel_filters, weights, config)
-    } else {
-        console_log!("loading float weights");
-        if is_multilingual {
-            let mel_filters = fetch_url("mel_filters.safetensors").await?;
-            let tokenizer = fetch_url("whisper-tiny/tokenizer.json").await?;
-            let weights = fetch_url("whisper-tiny/model.safetensors").await?;
-            let config = fetch_url("whisper-tiny/config.json").await?;
-            (tokenizer, mel_filters, weights, config)
-        } else {
-            let mel_filters = fetch_url("mel_filters.safetensors").await?;
-            let tokenizer = fetch_url("whisper-tiny.en/tokenizer.json").await?;
-            let weights = fetch_url("whisper-tiny.en/model.safetensors").await?;
-            let config = fetch_url("whisper-tiny.en/config.json").await?;
-            (tokenizer, mel_filters, weights, config)
-        }
-    };
-
-    let timestamps = true;
-    let _task = Some("transcribe".to_string());
-    console_log!("{}", weights.len());
-    Ok(ModelData {
-        tokenizer,
-        mel_filters,
-        weights,
-        config,
-        quantized,
-        timestamps,
-        task: None,
-        is_multilingual,
-        language: None,
-    })
+    chunk_queue: Vec<(Vec<u8>, usize)>, // (bytes, offset_samples)
 }
 
 fn performance_now() -> Option<f64> {
@@ -187,54 +123,74 @@ async fn start_recording(audio_context: AudioContext, is_muted: bool) -> Msg {
     Msg::RecordingStarted(result)
 }
 
+fn connect_ws(ctx: &Context<App>) -> Result<WebSocket, JsValue> {
+    let ws = WebSocket::new("ws://localhost:3000/ws")?;
+    ws.set_binary_type(BinaryType::Arraybuffer);
+
+    let link = ctx.link().clone();
+    let onmessage_callback =
+        Closure::<dyn FnMut(_)>::wrap(Box::new(move |e: web_sys::MessageEvent| {
+            if let Ok(abuffer) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
+                let vec = js_sys::Uint8Array::new(&abuffer).to_vec();
+                if let Ok(output) = bincode::deserialize::<InferenceOutput>(&vec) {
+                    link.send_message(Msg::WsOut(Ok(output)));
+                }
+            }
+        }));
+    ws.set_onmessage(Some(onmessage_callback.as_ref().unchecked_ref()));
+    onmessage_callback.forget();
+
+    let link = ctx.link().clone();
+    let onerror_callback =
+        Closure::<dyn FnMut(_)>::wrap(Box::new(move |e: web_sys::ErrorEvent| {
+            link.send_message(Msg::WsOut(Err(format!("WS Error: {:?}", e.message()))));
+        }));
+    ws.set_onerror(Some(onerror_callback.as_ref().unchecked_ref()));
+    onerror_callback.forget();
+
+    let link = ctx.link().clone();
+    let ws_clone = ws.clone();
+    let onopen_callback = Closure::<dyn FnMut()>::wrap(Box::new(move || {
+        link.send_message(Msg::WsConnected(ws_clone.clone()));
+    }));
+    ws.set_onopen(Some(onopen_callback.as_ref().unchecked_ref()));
+    onopen_callback.forget();
+
+    Ok(ws)
+}
+
 impl Component for App {
     type Message = Msg;
     type Properties = ();
 
     fn create(ctx: &Context<Self>) -> Self {
-        let status = "loading weights".to_string();
-        let cb = {
-            let link = ctx.link().clone();
-            move |e| link.send_message(Self::Message::WorkerOut(e))
-        };
-        let worker = Worker::bridge(std::rc::Rc::new(cb));
+        let status = "connecting to backend...".to_string();
+
+        let _ws = connect_ws(ctx).map_err(|e| console_log!("failed to connect ws: {:?}", e));
+
         Self {
             status,
             segments: vec![],
             current_decode: None,
-            worker,
-            loaded: false,
+            ws: None,
             recording: None,
             muted: true,
             _interval: None,
             decoded_samples: 0,
+            chunk_queue: vec![],
         }
     }
 
-    fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
-        if first_render {
-            ctx.link().send_future(async {
-                match model_data_load().await {
-                    Err(err) => {
-                        let status = format!("{err:?}");
-                        Msg::UpdateStatus(status)
-                    }
-                    Ok(model_data) => Msg::SetDecoder(model_data),
-                }
-            });
-        }
-    }
+    fn rendered(&mut self, _ctx: &Context<Self>, _first_render: bool) {}
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
-            Msg::SetDecoder(md) => {
-                self.status = "weights loaded successfully!".to_string();
-                self.loaded = true;
-                console_log!("loaded weights");
-                self.worker.send(WorkerInput::ModelData(md));
+            Msg::WsConnected(ws) => {
+                self.ws = Some(ws);
+                self.status = "connected to backend".to_string();
                 true
             }
-            Msg::WorkerOut(output) => {
+            Msg::WsOut(output) => {
                 let dt = self.current_decode.as_ref().and_then(|current_decode| {
                     current_decode.start_time.and_then(|start_time| {
                         performance_now().map(|stop_time| stop_time - start_time)
@@ -242,8 +198,7 @@ impl Component for App {
                 });
                 let current_decode = self.current_decode.take();
                 match output {
-                    Ok(WorkerOutput::WeightsLoaded) => self.status = "weights loaded!".to_string(),
-                    Ok(WorkerOutput::Decoded(new_segments)) => {
+                    Ok(InferenceOutput::Decoded(new_segments)) => {
                         self.status = match dt {
                             None => "decoding succeeded!".to_string(),
                             Some(dt) => format!("decoding succeeded in {dt:.2}s"),
@@ -256,14 +211,25 @@ impl Component for App {
                             }
                         }
                     }
+                    Ok(InferenceOutput::Error(err)) => {
+                        self.status = format!("backend error: {err}");
+                    }
                     Err(err) => {
-                        self.status = format!("decoding error {err:?}");
+                        self.status = format!("websocket error: {err}");
                     }
                 }
-                true
-            }
-            Msg::WorkerIn(inp) => {
-                self.worker.send(inp);
+                
+                // Try to send the next chunk from the queue
+                if self.current_decode.is_none() && !self.chunk_queue.is_empty() {
+                    if let Some(ws) = &self.ws {
+                        let (bytes, offset_samples) = self.chunk_queue.remove(0);
+                        let start_time = performance_now();
+                        self.current_decode = Some(CurrentDecode { start_time, offset_samples });
+                        console_log!("Sending next queued chunk of {} bytes, {} remaining in queue", bytes.len(), self.chunk_queue.len());
+                        let _ = ws.send_with_u8_array(&bytes);
+                    }
+                }
+                
                 true
             }
             Msg::UpdateStatus(status) => {
@@ -295,32 +261,53 @@ impl Component for App {
                         }
                     }
 
-                    // Start periodic processing every 5 seconds
+                    // Start periodic processing every 2 seconds
                     let link = ctx.link().clone();
-                    self._interval = Some(gloo_timers::callback::Interval::new(5000, move || {
+                    self._interval = Some(gloo_timers::callback::Interval::new(2000, move || {
                         link.send_message(Msg::Process);
                     }));
                 }
                 true
             }
             Msg::Process => {
-                if !self.muted && self.current_decode.is_none() {
+                console_log!(
+                    "Msg::Process triggered {} {}",
+                    self.muted,
+                    self.current_decode.is_none()
+                );
+                
+                // Collect any new samples into the queue
+                if !self.muted {
                     if let Some(recording) = &self.recording {
                         let all_samples = recording.samples.borrow();
                         let new_samples_count = all_samples.len();
                         if new_samples_count > self.decoded_samples {
                             let samples = all_samples[self.decoded_samples..].to_vec();
-                            let start_time = performance_now();
                             let offset_samples = self.decoded_samples;
                             self.decoded_samples = new_samples_count;
-                            self.current_decode =
-                                Some(CurrentDecode { start_time, offset_samples });
-                            ctx.link().send_message(Msg::WorkerIn(WorkerInput::DecodeTaskRaw {
-                                samples,
-                            }));
+                            
+                            // Convert samples to bytes and add to queue
+                            let mut bytes = Vec::with_capacity(samples.len() * 4);
+                            for s in samples {
+                                bytes.extend_from_slice(&s.to_le_bytes());
+                            }
+                            self.chunk_queue.push((bytes, offset_samples));
+                            console_log!("Queued chunk of {} bytes, queue size: {}", self.chunk_queue[self.chunk_queue.len() - 1].0.len(), self.chunk_queue.len());
                         }
                     }
                 }
+                
+                // Try to send the next chunk from the queue if backend is ready
+                if self.current_decode.is_none() && !self.chunk_queue.is_empty() {
+                    if let Some(ws) = &self.ws {
+                        let (bytes, offset_samples) = self.chunk_queue.remove(0);
+                        let start_time = performance_now();
+                        self.current_decode = Some(CurrentDecode { start_time, offset_samples });
+                        console_log!("Sending chunk of {} bytes from queue", bytes.len());
+                        let _ = ws.send_with_u8_array(&bytes);
+                    }
+                }
+                
                 false
             }
             Msg::RecordingStarted(result) => {
@@ -339,21 +326,16 @@ impl Component for App {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
+        let label = if self.muted { "Unmute" } else { "Mute" };
         html! {
             <div>
                 <div>
-                  { if self.loaded {
-                      let label = if self.muted { "Unmute" } else { "Mute" };
-                      html!(<button class="button" onclick={ctx.link().callback(move |_| Msg::ToggleMute)}> { label }</button>)
-                  } else { html!() } }
+                  <button class="button" onclick={ctx.link().callback(move |_| Msg::ToggleMute)}> { label }</button>
                 </div>
                 <h2>
                   {&self.status}
                 </h2>
                 {
-                    if !self.loaded {
-                        html! { <progress id="progress-bar" aria-label="loading weights…"></progress> }
-                    } else {
                         html! {
                             <>
                             { if self.current_decode.is_some() {
@@ -374,13 +356,6 @@ impl Component for App {
                             </>
                         }
                     }
-                }
-
-                // Display the current date and time the page was rendered
-                <p class="footer">
-                    { "Rendered: " }
-                    { String::from(Date::new_0().to_string()) }
-                </p>
             </div>
         }
     }

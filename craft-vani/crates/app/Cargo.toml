@@ -1,0 +1,59 @@
+[package]
+name = "frontend"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+inference = { path = "../inference" }
+anyhow = { version = "1", features = ["backtrace"] }
+log = "0.4"
+rand = "0.9.0"
+serde = { version = "1.0.171", features = ["derive"] }
+serde_json = "1.0.99"
+gloo-timers = "0.3"
+hound = "3.5.1"
+safetensors = "0.7.0"
+bincode = "1.3.3"
+getrandom = { version = "0.2", features = ["js"] }
+gloo = "0.11"
+js-sys = "0.3.64"
+wasm-bindgen = "0.2.87"
+wasm-bindgen-futures = "0.4.37"
+wasm-logger = "0.2"
+yew = { version = "0.20.0", features = ["csr"] }
+
+[dependencies.web-sys]
+version = "0.3.70"
+features = [
+  'AudioBuffer',
+  'AudioContext',
+  'AudioContextOptions',
+  'AudioDestinationNode',
+  'AudioNode',
+  'AudioProcessingEvent',
+  'BaseAudioContext',
+  'Blob',
+  'Document',
+  'Element',
+  'HtmlElement',
+  'MediaDevices',
+  'MediaStream',
+  'MediaStreamAudioSourceNode',
+  'MediaStreamConstraints',
+  'MediaStreamTrack',
+  'Navigator',
+  'Node',
+  'Window',
+  'Request',
+  'RequestCache',
+  'RequestInit',
+  'RequestMode',
+  'Response',
+  'Performance',
+  'ScriptProcessorNode',
+  'WebSocket',
+  'MessageEvent',
+  'ErrorEvent',
+  'BinaryType',
+  'console',
+]

@@ -1,0 +1,36 @@
+services:
+  caddy:
+    image: caddy:2
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - backend
+      - frontend
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    expose:
+      - "3000"
+    volumes:
+      - ./whisper-tiny.en:/app/whisper-tiny.en
+      - ./mel_filters.safetensors:/app/mel_filters.safetensors
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    expose:
+      - "80"
+    depends_on:
+      - backend
+
+volumes:
+  caddy_data:
+  caddy_config:

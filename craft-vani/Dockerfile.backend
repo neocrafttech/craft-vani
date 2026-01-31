@@ -1,0 +1,53 @@
+# Dockerfile for backend
+FROM rust:1.93-slim AS builder
+
+RUN apt-get update && apt-get install -y \
+    protobuf-compiler \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    libasound2-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy the workspace configuration
+COPY Cargo.toml Cargo.lock ./
+COPY crates/inference/Cargo.toml crates/inference/
+COPY crates/server/Cargo.toml crates/server/
+COPY crates/app/Cargo.toml crates/app/
+
+# Create dummy source files to pre-build dependencies
+RUN mkdir -p crates/inference/src && touch crates/inference/src/lib.rs && \
+    mkdir -p crates/server/src && echo "fn main() { println!(\"dummy\"); }" > crates/server/src/main.rs && \
+    mkdir -p crates/app/src && echo "fn main() { println!(\"dummy\"); }" > crates/app/src/main.rs
+
+# Build dependencies
+RUN cargo build --release -p server
+
+# Copy the actual source code
+COPY crates crates/
+COPY whisper-tiny.en/ whisper-tiny.en/
+COPY mel_filters.safetensors .
+
+# Build the real application
+RUN cargo build --release -p server
+
+# Final image
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libasound2 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy the binary and models
+COPY --from=builder /app/target/release/server /usr/local/bin/server
+COPY --from=builder /app/whisper-tiny.en/ whisper-tiny.en/
+COPY --from=builder /app/mel_filters.safetensors .
+
+EXPOSE 3000
+
+CMD ["server"]
