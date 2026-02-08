@@ -1,0 +1,32 @@
+# Dockerfile for frontend
+FROM rust:1.93 AS builder
+
+# Install trunk and wasm-target
+RUN cargo install --locked trunk
+RUN rustup target add wasm32-unknown-unknown
+
+WORKDIR /app
+
+# Copy the workspace configuration
+COPY Cargo.toml Cargo.lock ./
+COPY crates/inference/Cargo.toml crates/inference/
+COPY crates/server/Cargo.toml crates/server/
+COPY crates/app/Cargo.toml crates/app/
+
+# Build dependencies (this is trickier with Trunk, but we'll copy everything for now)
+COPY . .
+
+# Build the frontend using Trunk
+WORKDIR /app/crates/app
+RUN trunk build --release
+
+# Final stage: Nginx
+FROM nginx:alpine
+
+# Copy the built assets to nginx public directory
+COPY --from=builder /app/crates/app/dist /usr/share/nginx/html
+
+# Expose port 80 (nginx default)
+EXPOSE 80
+
+CMD ["nginx", "-g", "daemon off;"]
