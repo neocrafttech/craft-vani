@@ -124,7 +124,9 @@ async fn start_recording(audio_context: AudioContext, is_muted: bool) -> Msg {
 }
 
 fn connect_ws(ctx: &Context<App>) -> Result<WebSocket, JsValue> {
-    let ws = WebSocket::new("ws://localhost:3000/ws")?;
+    const API_URL: &str = env!("TRUNK_PUBLIC_API_URL");
+
+    let ws = WebSocket::new(API_URL)?;
     ws.set_binary_type(BinaryType::Arraybuffer);
 
     let link = ctx.link().clone();
