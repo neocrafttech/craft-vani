@@ -1,7 +1,13 @@
-# Dockerfile for backend
-FROM rust:1.93-slim-bookworm AS builder
+FROM nvidia/cuda:12.3.2-devel-ubuntu22.04 AS builder
+
+ENV CUDA_HOME=/usr/local/cuda
+ENV CARGO_HOME=/usr/local/cargo
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV PATH=/usr/local/cargo/bin:/usr/local/cuda/bin:$PATH
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 
 RUN apt-get update && apt-get install -y \
+    curl \
     protobuf-compiler \
     build-essential \
     pkg-config \
@@ -10,15 +16,31 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-
-# Copy the actual source code
 COPY . .
 
-# Build the real application
+ENV CUDA_COMPUTE_CAP=75
+
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+  | sh -s -- -y --no-modify-path --default-toolchain 1.93
+
+# Fetch dependencies first
+RUN cargo fetch
+
+# Patch candle-kernels to disable bfloat16 WMMA on sm_75
+RUN find /usr/local/cargo/registry/src -type f -path "*/candle-kernels-*/src/moe/moe_wmma.cu" -exec bash -c ' \
+    sed -i "/LAUNCH_MOE_GEMM_GROUPED.*nv_bfloat16.*16.*16.*2/s/^/\/\/ /" "$0" && \
+    sed -i "/LAUNCH_MOE_GEMM_GROUPED.*nv_bfloat16.*8.*32.*1/s/^/\/\/ /" "$0" \
+' {} \;
+
+RUN find /usr/local/cargo/registry/src -type f -path "*/candle-kernels-*/src/moe/moe_wmma_gguf.cu" -exec bash -c ' \
+    sed -i "s/LAUNCH_MOE_GEMM_GGUF(nv_bfloat16,/\/\/ LAUNCH_MOE_GEMM_GGUF(nv_bfloat16,/g" "$0" \
+' {} \;
+
+# Now build
 RUN cargo build --release -p server
 
-# Final image
-FROM debian:bookworm-slim
+FROM nvidia/cuda:12.3.2-runtime-ubuntu22.04
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
@@ -27,11 +49,9 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy the binary and models
 COPY --from=builder /app/target/release/server /usr/local/bin/server
-COPY --from=builder /app/whisper-tiny.en/ whisper-tiny.en/
+COPY --from=builder /app/whisper-small/ whisper-small/
 COPY --from=builder /app/mel_filters.safetensors .
 
 EXPOSE 3000
-
 CMD ["server"]
