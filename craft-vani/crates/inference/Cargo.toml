@@ -4,9 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-candle = { version = "0.9.2", package = "candle-core",  default-features = false, features = ["cuda"] }
-candle-nn = "0.9.2"
-candle-transformers = "0.9.2"
 num-traits = "0.2.15"
 tokenizers = { version = "0.22.0", default-features = false, features = ["unstable_wasm"] }
 anyhow = { version = "1", features = ["backtrace"] }
