@@ -117,6 +117,8 @@ setup_rust(){
     fi
     cargo nextest --version
     rustup target add wasm32-unknown-unknown
+    
+    cargo install --locked trunk
 }
 
 setup() {
@@ -168,6 +170,12 @@ launch() {
     echo "[OK] Application launched!"
 }
 
+serve() {
+    echo "[INFO] Starting server..."
+    cargo run -p server --release
+    echo "[OK] Application served!"
+}
+
 help() {
     echo "Usage: $0 [setup|check|format|clean|build|test|bench|all|help]"
     echo
@@ -209,6 +217,9 @@ main() {
             ;;
         launch)
             launch
+            ;;
+        serve)
+            serve
             ;;
         all)
             setup

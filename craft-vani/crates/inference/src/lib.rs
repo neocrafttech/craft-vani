@@ -1,5 +1,4 @@
 pub mod inference;
-pub use candle_transformers::models::whisper::{self as m, Config};
 pub use inference::{DecodingResult, InferenceOutput, Segment};
 use wasm_bindgen::prelude::*;
 

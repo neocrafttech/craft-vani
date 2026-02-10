@@ -1,40 +1,38 @@
-# Dockerfile for backend
-FROM rust:1.93-slim AS builder
+# ===== Builder stage =====
+FROM nvidia/cuda:12.3.2-devel-ubuntu22.04 AS builder
+
+ENV CUDA_HOME=/usr/local/cuda
+ENV CARGO_HOME=/usr/local/cargo
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV PATH=/usr/local/cargo/bin:/usr/local/cuda/bin:$PATH
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+ENV CUDA_COMPUTE_CAP=86
 
 RUN apt-get update && apt-get install -y \
+    curl \
     protobuf-compiler \
     build-essential \
     pkg-config \
     libssl-dev \
     libasound2-dev \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Rust first (before WORKDIR for better caching)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+  | sh -s -- -y --no-modify-path --default-toolchain 1.93
+
 WORKDIR /app
+COPY . .
 
-# Copy the workspace configuration
-COPY Cargo.toml Cargo.lock ./
-COPY crates/inference/Cargo.toml crates/inference/
-COPY crates/server/Cargo.toml crates/server/
-COPY crates/app/Cargo.toml crates/app/
-
-# Create dummy source files to pre-build dependencies
-RUN mkdir -p crates/inference/src && touch crates/inference/src/lib.rs && \
-    mkdir -p crates/server/src && echo "fn main() { println!(\"dummy\"); }" > crates/server/src/main.rs && \
-    mkdir -p crates/app/src && echo "fn main() { println!(\"dummy\"); }" > crates/app/src/main.rs
-
-# Build dependencies
+# Build
 RUN cargo build --release -p server
 
-# Copy the actual source code
-COPY crates crates/
-COPY whisper-tiny.en/ whisper-tiny.en/
-COPY mel_filters.safetensors .
+# ===== Runtime stage =====
+FROM nvidia/cuda:12.3.2-runtime-ubuntu22.04
 
-# Build the real application
-RUN cargo build --release -p server
-
-# Final image
-FROM debian:bookworm-slim
+ENV CUDA_HOME=/usr/local/cuda
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
@@ -43,7 +41,6 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy the binary and models
 COPY --from=builder /app/target/release/server /usr/local/bin/server
 COPY --from=builder /app/whisper-tiny.en/ whisper-tiny.en/
 COPY --from=builder /app/mel_filters.safetensors .

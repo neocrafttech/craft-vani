@@ -26,11 +26,11 @@ struct ServerState {
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let device = utils::device(true).unwrap();
+    let device = utils::device(false).unwrap();
     println!("Pre-loading model...");
 
     // Paths relative to the workspace root if run from there
-    let model_dir = Path::new("whisper-tiny");
+    let model_dir = Path::new("whisper-tiny.en");
     let mel_path = Path::new("mel_filters.safetensors");
 
     let decoder = match Decoder::load_from_dir(model_dir, mel_path, &device) {
@@ -68,19 +68,19 @@ async fn ws_handler(
 async fn handle_socket(socket: WebSocket, state: Arc<Mutex<ServerState>>) {
     println!("New WebSocket connection");
     let (sender, mut receiver) = socket.split();
-    
+
     // Create a channel to send inference tasks to a background task
     let (tx, mut rx) = mpsc::channel::<Vec<f32>>(100);
     let sender = Arc::new(Mutex::new(sender));
-    
+
     // Spawn a background task to handle inference
     let state_clone = state.clone();
     let sender_clone = sender.clone();
-    
+
     tokio::spawn(async move {
         while let Some(samples) = rx.recv().await {
             println!("[Inference] Processing {} samples", samples.len());
-            
+
             let mut state = state_clone.lock().await;
             if let Some(decoder) = &mut state.decoder {
                 match decoder.run_raw(&samples) {
@@ -97,9 +97,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<Mutex<ServerState>>) {
                     }
                     Err(err) => {
                         eprintln!("[Inference] Decoding error: {}", err);
-                        let resp = bincode::serialize::<InferenceOutput>(
-                            &InferenceOutput::Error(err.to_string()),
-                        )
+                        let resp = bincode::serialize::<InferenceOutput>(&InferenceOutput::Error(
+                            err.to_string(),
+                        ))
                         .unwrap();
                         drop(state);
                         let mut sender = sender_clone.lock().await;
@@ -123,7 +123,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<Mutex<ServerState>>) {
     while let Some(Ok(msg)) = receiver.next().await {
         if let Message::Binary(bin) = msg {
             println!("[WebSocket] Received chunk of {} bytes", bin.len());
-            
+
             let samples: Vec<f32> = if bin.len() % 4 == 0 {
                 bin.chunks_exact(4)
                     .map(|chunk| {
@@ -133,7 +133,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<Mutex<ServerState>>) {
                     })
                     .collect()
             } else {
-                eprintln!("[WebSocket] ERROR: Received {} bytes which is not divisible by 4", bin.len());
+                eprintln!(
+                    "[WebSocket] ERROR: Received {} bytes which is not divisible by 4",
+                    bin.len()
+                );
                 continue;
             };
 
