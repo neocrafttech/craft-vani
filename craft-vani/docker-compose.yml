@@ -30,7 +30,7 @@ services:
         expose:
             - "3000"
         volumes:
-            - ./whisper-small:/app/whisper-small:ro
+            - ./whisper-small.en:/app/whisper-small.en:ro
             - ./mel_filters.safetensors:/app/mel_filters.safetensors
         networks:
             - web

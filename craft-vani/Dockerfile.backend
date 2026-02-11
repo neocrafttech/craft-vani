@@ -42,7 +42,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY --from=builder /app/target/release/server /usr/local/bin/server
-COPY --from=builder /app/whisper-tiny.en/ whisper-tiny.en/
+COPY --from=builder /app/whisper-small.en/ whisper-small.en/
 COPY --from=builder /app/mel_filters.safetensors .
 
 EXPOSE 3000
