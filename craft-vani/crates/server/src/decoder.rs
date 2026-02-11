@@ -53,14 +53,13 @@ impl Model {
     }
 }
 
-pub use inference::{DecodingResult, Segment};
+pub use inference::inference::{DecodingResult, Segment};
 
 pub struct Decoder {
     pub model: Model,
     pub rng: rand::rngs::StdRng,
     pub task: Option<Task>,
     pub timestamps: bool,
-    pub verbose: bool,
     pub tokenizer: Tokenizer,
     pub suppress_tokens: Tensor,
     pub sot_token: u32,
@@ -78,7 +77,7 @@ impl Decoder {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         model: Model, tokenizer: Tokenizer, mel_filters: Vec<f32>, seed: u64, device: &Device,
-        language_token: Option<u32>, task: Option<Task>, timestamps: bool, verbose: bool,
+        language_token: Option<u32>, task: Option<Task>, timestamps: bool,
     ) -> Result<Self> {
         let no_timestamps_token = token_id(&tokenizer, m::NO_TIMESTAMPS_TOKEN)?;
         // Suppress the notimestamps token when in timestamps mode.
@@ -111,7 +110,6 @@ impl Decoder {
             tokenizer,
             task,
             timestamps,
-            verbose,
             suppress_tokens,
             sot_token,
             transcribe_token,
@@ -126,19 +124,43 @@ impl Decoder {
     }
 
     pub fn load_from_dir(dir: &Path, mel_path: &Path, device: &Device) -> Result<Self> {
-        let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(E::msg)?;
-
         let mel_filters = std::fs::read(mel_path)?;
         let mel_filters = ::safetensors::tensor::SafeTensors::deserialize(&mel_filters)?;
         let mel_filters = mel_filters.tensor("mel_80")?.load(device)?;
         let mel_filters = mel_filters.flatten_all()?.to_vec1::<f32>()?;
+        let quantized_dir = Path::new("quantized");
+        let quantized_config = quantized_dir.join("config-tiny-en.json");
+        let quantized_tokenizer = quantized_dir.join("tokenizer-tiny-en.json");
+        let quantized_weights = quantized_dir.join("model-tiny-en-q80.gguf");
+        let use_quantized = std::env::var("CRAFT_VANI_USE_QUANTIZED")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false);
 
-        let config: Config =
-            serde_json::from_reader(std::fs::File::open(dir.join("config.json"))?)?;
-
-        let weights_path = dir.join("model.safetensors");
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], m::DTYPE, device)? };
-        let model = Model::Normal(m::model::Whisper::load(&vb, config)?);
+        let (tokenizer, model) = if use_quantized
+            && quantized_config.exists()
+            && quantized_tokenizer.exists()
+            && quantized_weights.exists()
+        {
+            let config: Config = serde_json::from_reader(std::fs::File::open(&quantized_config)?)?;
+            let tokenizer = Tokenizer::from_file(quantized_tokenizer).map_err(E::msg)?;
+            let vb = candle_transformers::quantized_var_builder::VarBuilder::from_gguf(
+                &quantized_weights,
+                device,
+            )?;
+            let model = Model::Quantized(m::quantized_model::Whisper::load(&vb, config)?);
+            println!("Using quantized tiny-en model (CRAFT_VANI_USE_QUANTIZED=1)");
+            (tokenizer, model)
+        } else {
+            let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(E::msg)?;
+            let config: Config =
+                serde_json::from_reader(std::fs::File::open(dir.join("config.json"))?)?;
+            let weights_path = dir.join("model.safetensors");
+            let vb =
+                unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], m::DTYPE, device)? };
+            let model = Model::Normal(m::model::Whisper::load(&vb, config)?);
+            println!("Using normal safetensors model");
+            (tokenizer, model)
+        };
 
         let decoder = Self::new(
             model,
@@ -148,37 +170,24 @@ impl Decoder {
             device,
             None,
             Some(Task::Transcribe),
-            true,  // timestamps
-            false, // verbose
+            false, // timestamps
         )?;
         Ok(decoder)
     }
 
     pub fn run_raw(&mut self, pcm_data: &[f32]) -> Result<Vec<Segment>> {
-        println!("run_raw: Starting conversion to mel");
         let mel = m::audio::pcm_to_mel(self.model.config(), pcm_data, &self.mel_filters);
-        println!("run_raw: Mel conversion done");
         let mel_len = mel.len();
         let n_mels = self.model.config().num_mel_bins;
-        println!("run_raw: Creating tensor with mel_len={}, n_mels={}", mel_len, n_mels);
         let mel = Tensor::from_vec(mel, (1, n_mels, mel_len / n_mels), &self.device)?;
-        println!("run_raw: Tensor created, running inference");
         let segments = self.run(&mel, None)?;
-        println!("run_raw: Segment done");
         Ok(segments)
     }
 
     pub fn decode(&mut self, mel: &Tensor, t: f64) -> Result<DecodingResult> {
-        println!("decode: Starting with temperature={}", t);
         let model = &mut self.model;
-        println!("decode: Calling encoder_forward");
         let audio_features = model.encoder_forward(mel, true)?;
-        println!("decode: encoder_forward done, audio_features dims: {:?}", audio_features.dims());
-        if self.verbose {
-            println!("audio features: {:?}", audio_features.dims());
-        }
         let sample_len = model.config().max_target_positions / 2;
-        println!("decode: sample_len={}", sample_len);
         let mut sum_logprob = 0f64;
         let mut no_speech_prob = f64::NAN;
         let mut tokens = vec![self.sot_token];
@@ -192,11 +201,7 @@ impl Decoder {
         if !self.timestamps {
             tokens.push(self.no_timestamps_token);
         }
-        println!("decode: Starting main loop with sample_len={}", sample_len);
         for i in 0..sample_len {
-            if i % 100 == 0 && i > 0 {
-                println!("decode: Loop iteration {}/{}", i, sample_len);
-            }
             let tokens_t = Tensor::new(tokens.as_slice(), mel.device())?;
 
             // The model expects a batch dim but this inference loop does not handle
@@ -246,14 +251,8 @@ impl Decoder {
             }
             sum_logprob += prob.ln();
         }
-        println!("decode: Loop finished, generated {} tokens", tokens.len());
-        println!("decode: Token IDs: {:?}", &tokens[..std::cmp::min(20, tokens.len())]);
         let text = self.tokenizer.decode(&tokens, true).map_err(E::msg)?;
-        println!("decode: Text decoded: {}", text);
         let avg_logprob = sum_logprob / tokens.len() as f64;
-        println!("decode: avg_logprob={}, no_speech_prob={}", avg_logprob, no_speech_prob);
-
-        println!("decode: Returning DecodingResult");
         Ok(DecodingResult {
             tokens,
             text,
@@ -265,101 +264,38 @@ impl Decoder {
     }
 
     fn decode_with_fallback(&mut self, segment: &Tensor) -> Result<DecodingResult> {
-        println!("decode_with_fallback: Starting with {} temperatures", m::TEMPERATURES.len());
         for (i, &t) in m::TEMPERATURES.iter().enumerate() {
-            println!("decode_with_fallback: Trying temperature {} (index {}/{})", t, i, m::TEMPERATURES.len());
             let dr: Result<DecodingResult> = self.decode(segment, t);
-            println!("decode_with_fallback: decode() returned for temperature {}", t);
             if i == m::TEMPERATURES.len() - 1 {
                 return dr;
             }
             // On errors, we try again with a different temperature.
-            match dr {
-                Ok(dr) => {
-                    let needs_fallback = dr.compression_ratio > m::COMPRESSION_RATIO_THRESHOLD
-                        || dr.avg_logprob < m::LOGPROB_THRESHOLD;
-                    if !needs_fallback || dr.no_speech_prob > m::NO_SPEECH_THRESHOLD {
-                        println!("decode_with_fallback: Returning successfully");
-                        return Ok(dr);
-                    }
-                }
-                Err(err) => {
-                    println!("Error running at {t}: {err}")
+            if let Ok(dr) = dr {
+                let needs_fallback = dr.compression_ratio > m::COMPRESSION_RATIO_THRESHOLD
+                    || dr.avg_logprob < m::LOGPROB_THRESHOLD;
+                if !needs_fallback || dr.no_speech_prob > m::NO_SPEECH_THRESHOLD {
+                    return Ok(dr);
                 }
             }
         }
         unreachable!()
     }
 
-    pub fn run(&mut self, mel: &Tensor, times: Option<(f64, f64)>) -> Result<Vec<Segment>> {
-        println!("run: Starting with mel tensor");
+    pub fn run(&mut self, mel: &Tensor, _times: Option<(f64, f64)>) -> Result<Vec<Segment>> {
         let (_, _, content_frames) = mel.dims3()?;
-        println!("run: mel dims - content_frames={}", content_frames);
         let mut seek = 0;
         let mut segments = vec![];
         while seek < content_frames {
-            println!("run: Processing segment at seek={}", seek);
-            let start = std::time::Instant::now();
             let time_offset = (seek * m::HOP_LENGTH) as f64 / m::SAMPLE_RATE as f64;
             let segment_size = usize::min(content_frames - seek, m::N_FRAMES);
             let mel_segment = mel.narrow(2, seek, segment_size)?;
             let segment_duration = (segment_size * m::HOP_LENGTH) as f64 / m::SAMPLE_RATE as f64;
-            println!("run: Calling decode_with_fallback");
             let dr = self.decode_with_fallback(&mel_segment)?;
-            println!("run: decode_with_fallback completed, elapsed: {:?}", start.elapsed());
             seek += segment_size;
             if dr.no_speech_prob > m::NO_SPEECH_THRESHOLD && dr.avg_logprob < m::LOGPROB_THRESHOLD {
-                println!("no speech detected, skipping {seek} {dr:?}");
                 continue;
             }
             let segment = Segment { start: time_offset, duration: segment_duration, dr };
-            if self.timestamps {
-                println!("{:.1}s -- {:.1}s", segment.start, segment.start + segment.duration,);
-                let mut tokens_to_decode = vec![];
-                let mut prev_timestamp_s = 0f32;
-                for &token in segment.dr.tokens.iter() {
-                    if token == self.sot_token || token == self.eot_token {
-                        continue;
-                    }
-                    // The no_timestamp_token is the last before the timestamp ones.
-                    if token > self.no_timestamps_token {
-                        let timestamp_s = (token - self.no_timestamps_token + 1) as f32 / 50.;
-                        if !tokens_to_decode.is_empty() {
-                            let text =
-                                self.tokenizer.decode(&tokens_to_decode, true).map_err(E::msg)?;
-                            println!("  {:.1}s-{:.1}s: {}", prev_timestamp_s, timestamp_s, text);
-                            tokens_to_decode.clear()
-                        }
-                        prev_timestamp_s = timestamp_s;
-                    } else {
-                        tokens_to_decode.push(token)
-                    }
-                }
-                if !tokens_to_decode.is_empty() {
-                    let text = self.tokenizer.decode(&tokens_to_decode, true).map_err(E::msg)?;
-                    if !text.is_empty() {
-                        println!("  {:.1}s-...: {}", prev_timestamp_s, text);
-                    }
-                    tokens_to_decode.clear()
-                }
-            } else {
-                match times {
-                    Some((start, end)) => {
-                        println!("{:.1}s -- {:.1}s: {}", start, end, segment.dr.text)
-                    }
-                    None => {
-                        println!(
-                            "{:.1}s -- {:.1}s: {}",
-                            segment.start,
-                            segment.start + segment.duration,
-                            segment.dr.text,
-                        )
-                    }
-                }
-            }
-            if self.verbose {
-                println!("{seek}: {segment:?}, in {:?}", start.elapsed());
-            }
             segments.push(segment)
         }
         Ok(segments)

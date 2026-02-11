@@ -1,3 +1,4 @@
+use js_sys::{Object, Reflect};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
@@ -21,6 +22,7 @@ pub enum Msg {
 
 pub struct RecordingState {
     pub audio_context: AudioContext,
+    pub sample_rate: f32,
     pub stream: MediaStream,
     pub processor: ScriptProcessorNode,
     pub _closure: Closure<dyn FnMut(web_sys::AudioProcessingEvent)>,
@@ -58,7 +60,23 @@ async fn start_recording(audio_context: AudioContext, is_muted: bool) -> Msg {
         let devices = navigator.media_devices().map_err(|e| format!("{e:?}"))?;
 
         let constraints = web_sys::MediaStreamConstraints::new();
-        constraints.set_audio(&JsValue::from_bool(true));
+        let audio_constraints = Object::new();
+        let _ = Reflect::set(
+            &audio_constraints,
+            &JsValue::from_str("echoCancellation"),
+            &JsValue::from_bool(true),
+        );
+        let _ = Reflect::set(
+            &audio_constraints,
+            &JsValue::from_str("noiseSuppression"),
+            &JsValue::from_bool(true),
+        );
+        let _ = Reflect::set(
+            &audio_constraints,
+            &JsValue::from_str("autoGainControl"),
+            &JsValue::from_bool(true),
+        );
+        constraints.set_audio(&audio_constraints.into());
 
         let stream_promise = devices
             .get_user_media_with_constraints(&constraints)
@@ -110,6 +128,7 @@ async fn start_recording(audio_context: AudioContext, is_muted: bool) -> Msg {
             .map_err(|e| format!("{e:?}"))?;
 
         Ok(RecordingState {
+            sample_rate: audio_context.sample_rate(),
             audio_context,
             stream,
             processor,
@@ -161,6 +180,12 @@ fn connect_ws(ctx: &Context<App>) -> Result<WebSocket, JsValue> {
     Ok(ws)
 }
 
+fn send_audio_config(ws: &WebSocket, sample_rate: f32) {
+    let sample_rate = sample_rate.round() as u32;
+    let msg = format!(r#"{{"type":"config","sample_rate":{sample_rate}}}"#);
+    let _ = ws.send_with_str(&msg);
+}
+
 impl Component for App {
     type Message = Msg;
     type Properties = ();
@@ -190,6 +215,9 @@ impl Component for App {
             Msg::WsConnected(ws) => {
                 self.ws = Some(ws);
                 self.status = "connected to backend".to_string();
+                if let (Some(ws), Some(recording)) = (&self.ws, &self.recording) {
+                    send_audio_config(ws, recording.sample_rate);
+                }
                 true
             }
             Msg::WsOut(output) => {
@@ -220,18 +248,23 @@ impl Component for App {
                         self.status = format!("websocket error: {err}");
                     }
                 }
-                
+
                 // Try to send the next chunk from the queue
-                if self.current_decode.is_none() && !self.chunk_queue.is_empty() {
-                    if let Some(ws) = &self.ws {
-                        let (bytes, offset_samples) = self.chunk_queue.remove(0);
-                        let start_time = performance_now();
-                        self.current_decode = Some(CurrentDecode { start_time, offset_samples });
-                        console_log!("Sending next queued chunk of {} bytes, {} remaining in queue", bytes.len(), self.chunk_queue.len());
-                        let _ = ws.send_with_u8_array(&bytes);
-                    }
+                if self.current_decode.is_none()
+                    && !self.chunk_queue.is_empty()
+                    && let Some(ws) = &self.ws
+                {
+                    let (bytes, offset_samples) = self.chunk_queue.remove(0);
+                    let start_time = performance_now();
+                    self.current_decode = Some(CurrentDecode { start_time, offset_samples });
+                    console_log!(
+                        "Sending next queued chunk of {} bytes, {} remaining in queue",
+                        bytes.len(),
+                        self.chunk_queue.len()
+                    );
+                    let _ = ws.send_with_u8_array(&bytes);
                 }
-                
+
                 true
             }
             Msg::UpdateStatus(status) => {
@@ -277,39 +310,44 @@ impl Component for App {
                     self.muted,
                     self.current_decode.is_none()
                 );
-                
+
                 // Collect any new samples into the queue
-                if !self.muted {
-                    if let Some(recording) = &self.recording {
-                        let all_samples = recording.samples.borrow();
-                        let new_samples_count = all_samples.len();
-                        if new_samples_count > self.decoded_samples {
-                            let samples = all_samples[self.decoded_samples..].to_vec();
-                            let offset_samples = self.decoded_samples;
-                            self.decoded_samples = new_samples_count;
-                            
-                            // Convert samples to bytes and add to queue
-                            let mut bytes = Vec::with_capacity(samples.len() * 4);
-                            for s in samples {
-                                bytes.extend_from_slice(&s.to_le_bytes());
-                            }
-                            self.chunk_queue.push((bytes, offset_samples));
-                            console_log!("Queued chunk of {} bytes, queue size: {}", self.chunk_queue[self.chunk_queue.len() - 1].0.len(), self.chunk_queue.len());
+                if !self.muted
+                    && let Some(recording) = &self.recording
+                {
+                    let all_samples = recording.samples.borrow();
+                    let new_samples_count = all_samples.len();
+                    if new_samples_count > self.decoded_samples {
+                        let samples = all_samples[self.decoded_samples..].to_vec();
+                        let offset_samples = self.decoded_samples;
+                        self.decoded_samples = new_samples_count;
+
+                        // Convert samples to bytes and add to queue
+                        let mut bytes = Vec::with_capacity(samples.len() * 4);
+                        for s in samples {
+                            bytes.extend_from_slice(&s.to_le_bytes());
                         }
+                        self.chunk_queue.push((bytes, offset_samples));
+                        console_log!(
+                            "Queued chunk of {} bytes, queue size: {}",
+                            self.chunk_queue[self.chunk_queue.len() - 1].0.len(),
+                            self.chunk_queue.len()
+                        );
                     }
                 }
-                
+
                 // Try to send the next chunk from the queue if backend is ready
-                if self.current_decode.is_none() && !self.chunk_queue.is_empty() {
-                    if let Some(ws) = &self.ws {
-                        let (bytes, offset_samples) = self.chunk_queue.remove(0);
-                        let start_time = performance_now();
-                        self.current_decode = Some(CurrentDecode { start_time, offset_samples });
-                        console_log!("Sending chunk of {} bytes from queue", bytes.len());
-                        let _ = ws.send_with_u8_array(&bytes);
-                    }
+                if self.current_decode.is_none()
+                    && !self.chunk_queue.is_empty()
+                    && let Some(ws) = &self.ws
+                {
+                    let (bytes, offset_samples) = self.chunk_queue.remove(0);
+                    let start_time = performance_now();
+                    self.current_decode = Some(CurrentDecode { start_time, offset_samples });
+                    console_log!("Sending chunk of {} bytes from queue", bytes.len());
+                    let _ = ws.send_with_u8_array(&bytes);
                 }
-                
+
                 false
             }
             Msg::RecordingStarted(result) => {
@@ -317,6 +355,9 @@ impl Component for App {
                     Ok(state) => {
                         self.recording = Some(state);
                         self.status = "recording...".to_string();
+                        if let (Some(ws), Some(recording)) = (&self.ws, &self.recording) {
+                            send_audio_config(ws, recording.sample_rate);
+                        }
                     }
                     Err(err) => {
                         self.status = format!("recording error: {err}");

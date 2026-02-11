@@ -2309,9 +2309,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bincode",
- "candle-core",
- "candle-nn",
- "candle-transformers",
  "hound",
  "log",
  "num-traits",
