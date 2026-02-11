@@ -193,7 +193,7 @@ async fn main() {
     println!("Pre-loading model...");
 
     // Paths relative to the workspace root if run from there
-    let model_dir = Path::new("whisper-tiny.en");
+    let model_dir = Path::new("whisper-small.en");
     let mel_path = Path::new("mel_filters.safetensors");
 
     let decoder = match Decoder::load_from_dir(model_dir, mel_path, &device) {
