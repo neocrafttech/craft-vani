@@ -4,15 +4,19 @@ extern crate accelerate_src;
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 
+use std::path::Path;
+
 use anyhow::{Error as E, Result};
 use candle::safetensors::Load;
 use candle::{Device, IndexOp, Tensor};
-use candle_nn::{VarBuilder, ops::softmax};
+use candle_nn::VarBuilder;
+use candle_nn::ops::softmax;
 use candle_transformers::models::whisper::{self as m, Config};
-use clap::{Parser, ValueEnum};
-use rand::{SeedableRng, distr::Distribution};
+use clap::ValueEnum;
+use inference::{DecodingResult, Segment};
+use rand::SeedableRng;
+use rand::distr::Distribution;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use tokenizers::Tokenizer;
 
 pub enum Model {
@@ -52,8 +56,6 @@ impl Model {
         }
     }
 }
-
-pub use inference::inference::{DecodingResult, Segment};
 
 pub struct Decoder {
     pub model: Model,
@@ -131,9 +133,8 @@ impl Decoder {
     pub fn load_from_dir(dir: &Path, mel_path: &Path, device: &Device) -> Result<Self> {
         let preprocessor_config_path = dir.join("preprocessor_config.json");
         let mel_filters = if preprocessor_config_path.exists() {
-            let preprocessor_config: WhisperPreprocessorConfig = serde_json::from_reader(
-                std::fs::File::open(&preprocessor_config_path)?,
-            )?;
+            let preprocessor_config: WhisperPreprocessorConfig =
+                serde_json::from_reader(std::fs::File::open(&preprocessor_config_path)?)?;
             let mel_filters: Vec<f32> = preprocessor_config
                 .mel_filters
                 .into_iter()
@@ -145,10 +146,7 @@ impl Decoder {
                     preprocessor_config_path.to_string_lossy()
                 );
             }
-            println!(
-                "Loaded mel filters from {}",
-                preprocessor_config_path.to_string_lossy()
-            );
+            println!("Loaded mel filters from {}", preprocessor_config_path.to_string_lossy());
             mel_filters
         } else {
             let mel_filters = std::fs::read(mel_path)?;
@@ -350,80 +348,4 @@ pub fn token_id(tokenizer: &Tokenizer, token: &str) -> candle::Result<u32> {
 pub enum Task {
     Transcribe,
     Translate,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum WhichModel {
-    Tiny,
-    #[value(name = "tiny.en")]
-    TinyEn,
-    Base,
-    #[value(name = "base.en")]
-    BaseEn,
-    Small,
-    #[value(name = "small.en")]
-    SmallEn,
-    Medium,
-    #[value(name = "medium.en")]
-    MediumEn,
-    Large,
-    LargeV2,
-    LargeV3,
-    LargeV3Turbo,
-    #[value(name = "distil-medium.en")]
-    DistilMediumEn,
-    #[value(name = "distil-large-v2")]
-    DistilLargeV2,
-}
-
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// Run on CPU rather than on GPU.
-    #[arg(long)]
-    cpu: bool,
-
-    #[arg(long)]
-    model_id: Option<String>,
-
-    /// The model to use, check out available models:
-    /// https://huggingface.co/models?search=whisper
-    #[arg(long)]
-    revision: Option<String>,
-
-    /// The model to be used, can be tiny, small, medium.
-    #[arg(long, default_value = "tiny.en")]
-    model: WhichModel,
-
-    /// The seed to use when generating random samples.
-    #[arg(long, default_value_t = 299792458)]
-    seed: u64,
-
-    /// Enable tracing (generates a trace-timestamp.json file).
-    #[arg(long)]
-    tracing: bool,
-
-    #[arg(long)]
-    quantized: bool,
-
-    /// Language.
-    #[arg(long)]
-    language: Option<String>,
-
-    /// Task, when no task is specified, the input tokens contain only the sot token which can
-    /// improve things when in no-timestamp mode.
-    #[arg(long)]
-    task: Option<Task>,
-
-    /// Timestamps mode, this is not fully implemented yet.
-    #[arg(long)]
-    timestamps: bool,
-
-    /// Print the full DecodingResult structure rather than just the text.
-    #[arg(long)]
-    verbose: bool,
-
-    /// The input device to use.
-    #[arg(long)]
-    device: Option<String>,
 }

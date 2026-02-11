@@ -1,20 +1,19 @@
-use axum::{
-    Router,
-    extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    response::IntoResponse,
-    routing::get,
-};
-use futures_util::{SinkExt, StreamExt};
-use rubato::{FastFixedIn, PolynomialDegree, Resampler};
-use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+
+use axum::Router;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::response::IntoResponse;
+use axum::routing::get;
+use futures_util::{SinkExt, StreamExt};
+use inference::InferenceOutput;
+use rubato::{FastFixedIn, PolynomialDegree, Resampler};
+use serde::Deserialize;
 use tokio::sync::{Mutex, mpsc};
 use tower_http::cors::CorsLayer;
 
 use crate::decoder::Decoder;
-use inference::inference::InferenceOutput;
 mod decoder;
 mod utils;
 
@@ -103,7 +102,7 @@ fn is_low_value_text(text: &str) -> bool {
     alpha_count < 2
 }
 
-fn keep_segment(segment: &inference::inference::Segment) -> bool {
+fn keep_segment(segment: &inference::Segment) -> bool {
     let text_ok = is_meaningful_text(&segment.dr.text)
         && !is_hallucination_fragment(&segment.dr.text)
         && !is_low_value_text(&segment.dr.text);
@@ -189,7 +188,14 @@ impl AudioPipeline {
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let device = utils::device(false).unwrap();
+    let device = match utils::device() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Failed to initialize device: {}", e);
+            std::process::exit(1);
+        }
+    };
+
     println!("Pre-loading model...");
 
     // Paths relative to the workspace root if run from there

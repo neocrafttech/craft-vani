@@ -1,23 +1,24 @@
-pub mod inference;
-pub use inference::{DecodingResult, InferenceOutput, Segment};
-use wasm_bindgen::prelude::*;
+use serde::{Deserialize, Serialize};
 
-#[wasm_bindgen]
-extern "C" {
-    // Use `js_namespace` here to bind `console.log(..)` instead of just
-    // `log(..)`
-    #[wasm_bindgen(js_namespace = console)]
-    pub fn log(s: &str);
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecodingResult {
+    pub tokens: Vec<u32>,
+    pub text: String,
+    pub avg_logprob: f64,
+    pub no_speech_prob: f64,
+    pub temperature: f64,
+    pub compression_ratio: f64,
 }
 
-#[macro_export]
-macro_rules! console_log {
-    ($($t:tt)*) => {
-        {
-            #[cfg(target_arch = "wasm32")]
-            web_sys::console::log_1(&format_args!($($t)*).to_string().into());
-            #[cfg(not(target_arch = "wasm32"))]
-            println!($($t)*);
-        }
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Segment {
+    pub start: f64,
+    pub duration: f64,
+    pub dr: DecodingResult,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum InferenceOutput {
+    Decoded(Vec<Segment>),
+    Error(String),
 }
