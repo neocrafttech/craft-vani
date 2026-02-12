@@ -1,4 +1,4 @@
-use inference::{InferenceOutput, Segment};
+use inference::{InferenceOutput, InferenceResponse, SarvamOutput, Segment};
 use js_sys::{Object, Reflect};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -29,8 +29,10 @@ macro_rules! console_log {
 
 pub enum Msg {
     UpdateStatus(String),
-    WsOut(Result<InferenceOutput, String>),
+    WsOut(Result<InferenceResponse, String>),
     ToggleMute,
+    SetLeftEnabled(bool),
+    SetRightEnabled(bool),
     RecordingStarted(Result<RecordingState, String>),
     Process,
     WsConnected(WebSocket),
@@ -53,7 +55,10 @@ pub struct CurrentDecode {
 
 pub struct App {
     status: String,
-    segments: Vec<Segment>,
+    whisper_segments: Vec<Segment>,
+    sarvam_lines: Vec<String>,
+    left_enabled: bool,
+    right_enabled: bool,
     current_decode: Option<CurrentDecode>,
     ws: Option<WebSocket>,
     recording: Option<RecordingState>,
@@ -169,8 +174,12 @@ fn connect_ws(ctx: &Context<App>) -> Result<WebSocket, JsValue> {
         Closure::<dyn FnMut(_)>::wrap(Box::new(move |e: web_sys::MessageEvent| {
             if let Ok(abuffer) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
                 let vec = js_sys::Uint8Array::new(&abuffer).to_vec();
-                if let Ok(output) = bincode::deserialize::<InferenceOutput>(&vec) {
+                if let Ok(output) = bincode::deserialize::<InferenceResponse>(&vec) {
                     link.send_message(Msg::WsOut(Ok(output)));
+                } else if let Ok(legacy) = bincode::deserialize::<InferenceOutput>(&vec) {
+                    link.send_message(Msg::WsOut(Ok(InferenceResponse::Whisper {
+                        whisper: legacy,
+                    })));
                 }
             }
         }));
@@ -196,10 +205,46 @@ fn connect_ws(ctx: &Context<App>) -> Result<WebSocket, JsValue> {
     Ok(ws)
 }
 
-fn send_audio_config(ws: &WebSocket, sample_rate: f32) {
+fn send_audio_config(ws: &WebSocket, sample_rate: f32, left_enabled: bool, right_enabled: bool) {
     let sample_rate = sample_rate.round() as u32;
-    let msg = format!(r#"{{"type":"config","sample_rate":{sample_rate}}}"#);
+    let msg = format!(
+        r#"{{"type":"config","sample_rate":{sample_rate},"whisper_enabled":{left_enabled},"sarvam_enabled":{right_enabled}}}"#
+    );
     let _ = ws.send_with_str(&msg);
+}
+
+fn apply_whisper_output(
+    app: &mut App, current_decode: &Option<CurrentDecode>, whisper: InferenceOutput,
+) {
+    match whisper {
+        InferenceOutput::Decoded(new_segments) => {
+            if let Some(current) = current_decode {
+                let offset_secs = current.offset_samples as f64 / 16000.0;
+                for mut segment in new_segments {
+                    segment.start += offset_secs;
+                    app.whisper_segments.push(segment);
+                }
+            }
+        }
+        InferenceOutput::Error(err) => {
+            app.status = format!("whisper backend error: {err}");
+        }
+    }
+}
+
+fn apply_sarvam_output(app: &mut App, sarvam: SarvamOutput) {
+    match sarvam {
+        SarvamOutput::Text(text) => {
+            let text = text.trim().to_string();
+            if !text.is_empty() {
+                app.sarvam_lines.push(text);
+            }
+        }
+        SarvamOutput::Error(err) => {
+            app.status = format!("sarvam error: {err}");
+        }
+        SarvamOutput::Empty => {}
+    }
 }
 
 impl Component for App {
@@ -213,7 +258,10 @@ impl Component for App {
 
         Self {
             status,
-            segments: vec![],
+            whisper_segments: vec![],
+            sarvam_lines: vec![],
+            left_enabled: true,
+            right_enabled: false,
             current_decode: None,
             ws: None,
             recording: None,
@@ -232,7 +280,12 @@ impl Component for App {
                 self.ws = Some(ws);
                 self.status = "connected to backend".to_string();
                 if let (Some(ws), Some(recording)) = (&self.ws, &self.recording) {
-                    send_audio_config(ws, recording.sample_rate);
+                    send_audio_config(
+                        ws,
+                        recording.sample_rate,
+                        self.left_enabled,
+                        self.right_enabled,
+                    );
                 }
                 true
             }
@@ -244,21 +297,24 @@ impl Component for App {
                 });
                 let current_decode = self.current_decode.take();
                 match output {
-                    Ok(InferenceOutput::Decoded(new_segments)) => {
+                    Ok(output) => {
                         self.status = match dt {
                             None => "decoding succeeded!".to_string(),
                             Some(dt) => format!("decoding succeeded in {dt:.2}s"),
                         };
-                        if let Some(current) = current_decode {
-                            let offset_secs = current.offset_samples as f64 / 16000.0;
-                            for mut segment in new_segments {
-                                segment.start += offset_secs;
-                                self.segments.push(segment);
+
+                        match output {
+                            InferenceResponse::Whisper { whisper } => {
+                                apply_whisper_output(self, &current_decode, whisper)
+                            }
+                            InferenceResponse::Sarvam { sarvam } => {
+                                apply_sarvam_output(self, sarvam)
+                            }
+                            InferenceResponse::Both { whisper, sarvam } => {
+                                apply_whisper_output(self, &current_decode, whisper);
+                                apply_sarvam_output(self, sarvam);
                             }
                         }
-                    }
-                    Ok(InferenceOutput::Error(err)) => {
-                        self.status = format!("backend error: {err}");
                     }
                     Err(err) => {
                         self.status = format!("websocket error: {err}");
@@ -320,6 +376,24 @@ impl Component for App {
                 }
                 true
             }
+            Msg::SetLeftEnabled(enabled) => {
+                self.left_enabled = enabled;
+                if let Some(ws) = &self.ws {
+                    let sample_rate =
+                        self.recording.as_ref().map(|r| r.sample_rate).unwrap_or(16_000.0);
+                    send_audio_config(ws, sample_rate, self.left_enabled, self.right_enabled);
+                }
+                true
+            }
+            Msg::SetRightEnabled(enabled) => {
+                self.right_enabled = enabled;
+                if let Some(ws) = &self.ws {
+                    let sample_rate =
+                        self.recording.as_ref().map(|r| r.sample_rate).unwrap_or(16_000.0);
+                    send_audio_config(ws, sample_rate, self.left_enabled, self.right_enabled);
+                }
+                true
+            }
             Msg::Process => {
                 console_log!(
                     "Msg::Process triggered {} {}",
@@ -372,7 +446,12 @@ impl Component for App {
                         self.recording = Some(state);
                         self.status = "recording...".to_string();
                         if let (Some(ws), Some(recording)) = (&self.ws, &self.recording) {
-                            send_audio_config(ws, recording.sample_rate);
+                            send_audio_config(
+                                ws,
+                                recording.sample_rate,
+                                self.left_enabled,
+                                self.right_enabled,
+                            );
                         }
                     }
                     Err(err) => {
@@ -386,6 +465,8 @@ impl Component for App {
 
     fn view(&self, ctx: &Context<Self>) -> Html {
         let label = if self.muted { "Unmute" } else { "Mute" };
+        let left_toggle_label = if self.left_enabled { "Left: On" } else { "Left: Off" };
+        let right_toggle_label = if self.right_enabled { "Right: On" } else { "Right: Off" };
         html! {
             <div>
                 <div>
@@ -400,18 +481,56 @@ impl Component for App {
                             { if self.current_decode.is_some() {
                                 html! { <progress id="progress-bar" aria-label="decoding…"></progress> }
                             } else { html! {} } }
-                            <blockquote>
-                            <p>
-                              {
-                                  self.segments.iter().map(|segment| { html! {
-                                      <>
-                                      {&segment.dr.text}
-                                      <br/ >
-                                      </>
-                                  } }).collect::<Html>()
-                              }
-                            </p>
-                            </blockquote>
+                            <div style="display:flex; gap:16px; align-items:flex-start; flex-wrap:wrap;">
+                                <div style="flex:1; min-width:280px;">
+                                    <button
+                                      class="button button-outline"
+                                      onclick={ctx.link().callback({
+                                          let next = !self.left_enabled;
+                                          move |_| Msg::SetLeftEnabled(next)
+                                      })}
+                                    >
+                                      { left_toggle_label }
+                                    </button>
+                                    <h4>{"Current (Whisper)"}</h4>
+                                    <blockquote>
+                                        <p>
+                                          {
+                                              self.whisper_segments.iter().map(|segment| { html! {
+                                                  <>
+                                                  {&segment.dr.text}
+                                                  <br/ >
+                                                  </>
+                                              } }).collect::<Html>()
+                                          }
+                                        </p>
+                                    </blockquote>
+                                </div>
+                                <div style="flex:1; min-width:280px;">
+                                    <button
+                                      class="button button-outline"
+                                      onclick={ctx.link().callback({
+                                          let next = !self.right_enabled;
+                                          move |_| Msg::SetRightEnabled(next)
+                                      })}
+                                    >
+                                      { right_toggle_label }
+                                    </button>
+                                    <h4>{"SARVAM"}</h4>
+                                    <blockquote>
+                                        <p>
+                                          {
+                                              self.sarvam_lines.iter().map(|line| { html! {
+                                                  <>
+                                                  {line}
+                                                  <br/ >
+                                                  </>
+                                              } }).collect::<Html>()
+                                          }
+                                        </p>
+                                    </blockquote>
+                                </div>
+                            </div>
                             </>
                         }
                     }

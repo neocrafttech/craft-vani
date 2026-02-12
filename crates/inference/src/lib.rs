@@ -17,8 +17,22 @@ pub struct Segment {
     pub dr: DecodingResult,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum InferenceOutput {
     Decoded(Vec<Segment>),
     Error(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SarvamOutput {
+    Text(String),
+    Error(String),
+    Empty,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum InferenceResponse {
+    Whisper { whisper: InferenceOutput },
+    Sarvam { sarvam: SarvamOutput },
+    Both { whisper: InferenceOutput, sarvam: SarvamOutput },
 }

@@ -33,6 +33,7 @@ FROM nvidia/cuda:12.3.2-runtime-ubuntu22.04
 
 ENV CUDA_HOME=/usr/local/cuda
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+ENV MODEL_NAME=whisper-tiny.en
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
@@ -42,9 +43,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY --from=builder /app/target/release/server /usr/local/bin/server
-COPY --from=builder /app/whisper-small.en/ whisper-small.en/
-COPY --from=builder /app/mel_filters.safetensors .
 
 EXPOSE 3000
 
-CMD ["server"]
+CMD ["sh", "-c", "server --model ${MODEL_NAME}"]
