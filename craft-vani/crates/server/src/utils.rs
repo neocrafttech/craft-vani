@@ -2,10 +2,8 @@ use anyhow::Result;
 use candle::Device;
 use candle::utils::{cuda_is_available, metal_is_available};
 
-pub fn device(cpu: bool) -> Result<Device> {
-    if cpu {
-        Ok(Device::Cpu)
-    } else if cuda_is_available() {
+pub fn device() -> Result<Device> {
+    if cuda_is_available() {
         Ok(Device::new_cuda(0)?)
     } else if metal_is_available() {
         Ok(Device::new_metal(0)?)
