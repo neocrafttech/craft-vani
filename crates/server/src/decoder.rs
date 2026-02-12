@@ -7,7 +7,6 @@ extern crate intel_mkl_src;
 use std::path::Path;
 
 use anyhow::{Error as E, Result};
-use candle::safetensors::Load;
 use candle::{Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_nn::ops::softmax;
@@ -130,32 +129,21 @@ impl Decoder {
         })
     }
 
-    pub fn load_from_dir(dir: &Path, mel_path: &Path, device: &Device) -> Result<Self> {
+    pub fn load_from_dir(dir: &Path, device: &Device) -> Result<Self> {
         let preprocessor_config_path = dir.join("preprocessor_config.json");
-        let mel_filters = if preprocessor_config_path.exists() {
-            let preprocessor_config: WhisperPreprocessorConfig =
-                serde_json::from_reader(std::fs::File::open(&preprocessor_config_path)?)?;
-            let mel_filters: Vec<f32> = preprocessor_config
-                .mel_filters
-                .into_iter()
-                .flat_map(|row| row.into_iter())
-                .collect();
-            if mel_filters.is_empty() {
-                anyhow::bail!(
-                    "empty mel_filters in {}",
-                    preprocessor_config_path.to_string_lossy()
-                );
-            }
-            println!("Loaded mel filters from {}", preprocessor_config_path.to_string_lossy());
-            mel_filters
-        } else {
-            let mel_filters = std::fs::read(mel_path)?;
-            let mel_filters = ::safetensors::tensor::SafeTensors::deserialize(&mel_filters)?;
-            let mel_filters = mel_filters.tensor("mel_80")?.load(device)?;
-            let mel_filters = mel_filters.flatten_all()?.to_vec1::<f32>()?;
-            println!("Loaded mel filters from {}", mel_path.to_string_lossy());
-            mel_filters
-        };
+        if !preprocessor_config_path.exists() {
+            anyhow::bail!("preprocessor_config.json not found in {}", dir.to_string_lossy());
+        }
+
+        let preprocessor_config: WhisperPreprocessorConfig =
+            serde_json::from_reader(std::fs::File::open(&preprocessor_config_path)?)?;
+        let mel_filters: Vec<f32> =
+            preprocessor_config.mel_filters.into_iter().flat_map(|row| row.into_iter()).collect();
+        if mel_filters.is_empty() {
+            anyhow::bail!("empty mel_filters in {}", preprocessor_config_path.to_string_lossy());
+        }
+        println!("Loaded mel filters from {}", preprocessor_config_path.to_string_lossy());
+
         let quantized_dir = Path::new("quantized");
         let quantized_config = quantized_dir.join("config-tiny-en.json");
         let quantized_tokenizer = quantized_dir.join("tokenizer-tiny-en.json");
