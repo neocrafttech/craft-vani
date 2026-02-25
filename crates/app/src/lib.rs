@@ -50,7 +50,6 @@ pub struct RecordingState {
 
 pub struct CurrentDecode {
     pub start_time: Option<f64>,
-    pub offset_samples: usize,
 }
 
 pub struct App {
@@ -65,7 +64,7 @@ pub struct App {
     muted: bool,
     _interval: Option<gloo_timers::callback::Interval>,
     decoded_samples: usize,
-    chunk_queue: Vec<(Vec<u8>, usize)>, // (bytes, offset_samples)
+    chunk_queue: Vec<Vec<u8>>,
 }
 
 fn performance_now() -> Option<f64> {
@@ -218,11 +217,20 @@ fn apply_whisper_output(
 ) {
     match whisper {
         InferenceOutput::Decoded(new_segments) => {
-            if let Some(current) = current_decode {
-                let offset_secs = current.offset_samples as f64 / 16000.0;
-                for mut segment in new_segments {
-                    segment.start += offset_secs;
-                    app.whisper_segments.push(segment);
+            if current_decode.is_some() {
+                for segment in new_segments {
+                    let text = segment.dr.text.trim();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let duplicate_last = app
+                        .whisper_segments
+                        .last()
+                        .map(|last| normalize_text(&last.dr.text) == normalize_text(text))
+                        .unwrap_or(false);
+                    if !duplicate_last {
+                        app.whisper_segments.push(segment);
+                    }
                 }
             }
         }
@@ -230,6 +238,16 @@ fn apply_whisper_output(
             app.status = format!("whisper backend error: {err}");
         }
     }
+}
+
+fn normalize_text(text: &str) -> String {
+    text.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn apply_sarvam_output(app: &mut App, sarvam: SarvamOutput) {
@@ -326,9 +344,9 @@ impl Component for App {
                     && !self.chunk_queue.is_empty()
                     && let Some(ws) = &self.ws
                 {
-                    let (bytes, offset_samples) = self.chunk_queue.remove(0);
+                    let bytes = self.chunk_queue.remove(0);
                     let start_time = performance_now();
-                    self.current_decode = Some(CurrentDecode { start_time, offset_samples });
+                    self.current_decode = Some(CurrentDecode { start_time });
                     console_log!(
                         "Sending next queued chunk of {} bytes, {} remaining in queue",
                         bytes.len(),
@@ -409,7 +427,6 @@ impl Component for App {
                     let new_samples_count = all_samples.len();
                     if new_samples_count > self.decoded_samples {
                         let samples = all_samples[self.decoded_samples..].to_vec();
-                        let offset_samples = self.decoded_samples;
                         self.decoded_samples = new_samples_count;
 
                         // Convert samples to bytes and add to queue
@@ -417,10 +434,10 @@ impl Component for App {
                         for s in samples {
                             bytes.extend_from_slice(&s.to_le_bytes());
                         }
-                        self.chunk_queue.push((bytes, offset_samples));
+                        self.chunk_queue.push(bytes);
                         console_log!(
                             "Queued chunk of {} bytes, queue size: {}",
-                            self.chunk_queue[self.chunk_queue.len() - 1].0.len(),
+                            self.chunk_queue[self.chunk_queue.len() - 1].len(),
                             self.chunk_queue.len()
                         );
                     }
@@ -431,9 +448,9 @@ impl Component for App {
                     && !self.chunk_queue.is_empty()
                     && let Some(ws) = &self.ws
                 {
-                    let (bytes, offset_samples) = self.chunk_queue.remove(0);
+                    let bytes = self.chunk_queue.remove(0);
                     let start_time = performance_now();
-                    self.current_decode = Some(CurrentDecode { start_time, offset_samples });
+                    self.current_decode = Some(CurrentDecode { start_time });
                     console_log!("Sending chunk of {} bytes from queue", bytes.len());
                     let _ = ws.send_with_u8_array(&bytes);
                 }

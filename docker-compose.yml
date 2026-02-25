@@ -32,6 +32,8 @@ services:
     environment:
       - MODEL_NAME=${MODEL_NAME}
       - SARVAM_API_KEY=${SARVAM_API_KEY}
+      - CRAFT_VANI_LANGUAGE=${CRAFT_VANI_LANGUAGE}
+      - CRAFT_VANI_MIN_DECODE_SECONDS=${CRAFT_VANI_MIN_DECODE_SECONDS}
     volumes:
       - ./${MODEL_NAME}:/app/${MODEL_NAME}:ro
     networks:

@@ -23,7 +23,8 @@ mod decoder;
 mod utils;
 
 const TARGET_SAMPLE_RATE: usize = 16_000;
-const MIN_DECODE_SECONDS: usize = 2;
+const MIN_DECODE_SECONDS: usize = 4;
+const DEFAULT_OVERLAP_SECONDS: usize = 1;
 const RESAMPLE_CHUNK_SIZE: usize = 1024;
 const MIN_TEXT_LEN: usize = 3;
 const MIN_AVG_LOGPROB: f64 = -1.2;
@@ -40,12 +41,13 @@ const SARVAM_TIMEOUT_SECS: u64 = 4;
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Path to the whisper model directory
-    #[arg(short, long, default_value = "whisper-tiny.en")]
-    model: String,
+    #[arg(short, long)]
+    model: Option<String>,
 }
 
 struct ServerState {
     decoder: Option<Decoder>,
+    decoder_error: Option<String>,
     sarvam_client: reqwest::Client,
     sarvam_api_key: Option<String>,
 }
@@ -82,13 +84,15 @@ impl Default for EngineSelection {
 
 struct AudioPipeline {
     in_sample_rate: usize,
+    min_decode_samples: usize,
+    overlap_samples: usize,
     buffered_pcm: Vec<f32>,
     resampler: FastFixedIn<f32>,
 }
 
 #[derive(Default)]
 struct TranscriptStabilizer {
-    _last_emitted: Option<String>,
+    last_emitted: Option<String>,
 }
 
 impl TranscriptStabilizer {
@@ -97,7 +101,18 @@ impl TranscriptStabilizer {
         if normalized.is_empty() {
             return false;
         }
-        self._last_emitted = Some(normalized);
+        if let Some(last) = &self.last_emitted {
+            if normalized == *last {
+                return false;
+            }
+            if normalized.starts_with(last) {
+                let delta = normalized.len().saturating_sub(last.len());
+                if delta < 3 {
+                    return false;
+                }
+            }
+        }
+        self.last_emitted = Some(normalized);
         true
     }
 }
@@ -265,9 +280,25 @@ fn empty_response(selection: EngineSelection) -> InferenceResponse {
 }
 
 impl AudioPipeline {
+    fn decode_window_seconds() -> usize {
+        let from_env = std::env::var("CRAFT_VANI_MIN_DECODE_SECONDS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(MIN_DECODE_SECONDS);
+        from_env.clamp(1, 15)
+    }
+
     fn new(in_sample_rate: usize) -> anyhow::Result<Self> {
         let sample_rate = in_sample_rate.max(1);
         let resample_ratio = TARGET_SAMPLE_RATE as f64 / sample_rate as f64;
+        let decode_window_seconds = Self::decode_window_seconds();
+        let min_decode_samples = decode_window_seconds * sample_rate;
+        let overlap_seconds = std::env::var("CRAFT_VANI_OVERLAP_SECONDS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_OVERLAP_SECONDS)
+            .clamp(0, 5);
+        let overlap_samples = overlap_seconds * sample_rate;
         let resampler = FastFixedIn::new(
             resample_ratio,
             10.0,
@@ -275,7 +306,17 @@ impl AudioPipeline {
             RESAMPLE_CHUNK_SIZE,
             1,
         )?;
-        Ok(Self { in_sample_rate: sample_rate, buffered_pcm: Vec::new(), resampler })
+        println!(
+            "[Inference] Decode window: {}s (+{}s overlap, {} input samples @ {} Hz)",
+            decode_window_seconds, overlap_seconds, min_decode_samples, sample_rate
+        );
+        Ok(Self {
+            in_sample_rate: sample_rate,
+            min_decode_samples,
+            overlap_samples,
+            buffered_pcm: Vec::new(),
+            resampler,
+        })
     }
 
     fn set_sample_rate(&mut self, in_sample_rate: usize) -> anyhow::Result<()> {
@@ -286,12 +327,15 @@ impl AudioPipeline {
 
     fn push_and_resample_if_ready(&mut self, samples: &[f32]) -> anyhow::Result<Option<Vec<f32>>> {
         self.buffered_pcm.extend_from_slice(samples);
-        if self.buffered_pcm.len() < MIN_DECODE_SECONDS * self.in_sample_rate {
+        if self.buffered_pcm.len() < self.min_decode_samples {
             return Ok(None);
         }
 
         let full_chunks = self.buffered_pcm.len() / RESAMPLE_CHUNK_SIZE;
-        let remainder = self.buffered_pcm.len() % RESAMPLE_CHUNK_SIZE;
+        if full_chunks == 0 {
+            return Ok(None);
+        }
+        let processed_len = full_chunks * RESAMPLE_CHUNK_SIZE;
         let mut resampled_pcm = Vec::new();
         for chunk in 0..full_chunks {
             let start = chunk * RESAMPLE_CHUNK_SIZE;
@@ -301,15 +345,35 @@ impl AudioPipeline {
             resampled_pcm.extend_from_slice(&pcm[0]);
         }
 
-        if remainder == 0 {
-            self.buffered_pcm.clear();
-        } else {
-            self.buffered_pcm.copy_within(full_chunks * RESAMPLE_CHUNK_SIZE.., 0);
-            self.buffered_pcm.truncate(remainder);
-        }
+        let max_overlap = processed_len.saturating_sub(RESAMPLE_CHUNK_SIZE);
+        let overlap = self.overlap_samples.min(max_overlap);
+        let keep_from = processed_len.saturating_sub(overlap);
+        self.buffered_pcm.copy_within(keep_from.., 0);
+        self.buffered_pcm.truncate(self.buffered_pcm.len() - keep_from);
 
         if resampled_pcm.is_empty() { Ok(None) } else { Ok(Some(resampled_pcm)) }
     }
+}
+
+fn choose_model_dir(args_model: Option<String>) -> String {
+    if let Some(model) = args_model {
+        return model;
+    }
+
+    if let Ok(model) = std::env::var("MODEL_NAME")
+        && !model.trim().is_empty()
+    {
+        return model;
+    }
+
+    let candidates = ["whisper-small", "whisper-tiny.en", "whisper-base", "whisper-medium"];
+    for candidate in candidates {
+        if Path::new(candidate).exists() {
+            return candidate.to_string();
+        }
+    }
+
+    "whisper-small".to_string()
 }
 
 #[tokio::main]
@@ -329,16 +393,23 @@ async fn main() {
 
     let args = Args::parse();
     // Paths relative to the workspace root if run from there
-    let model_dir = Path::new(&args.model);
+    let model_name = choose_model_dir(args.model);
+    let model_dir = Path::new(&model_name);
+    println!("Using model directory: {}", model_name);
 
-    let decoder = match Decoder::load_from_dir(model_dir, &device) {
+    let (decoder, decoder_error) = match Decoder::load_from_dir(model_dir, &device) {
         Ok(d) => {
             println!("Model pre-loaded successfully");
-            Some(d)
+            (Some(d), None)
         }
         Err(e) => {
-            eprintln!("Failed to pre-load model at {:?}: {}", model_dir, e);
-            None
+            let details = format!(
+                "Failed to pre-load model at {}: {}. Provide a valid model via --model <dir> or MODEL_NAME=<dir> and ensure preprocessor_config.json, config.json, tokenizer.json, and model weights are present.",
+                model_dir.display(),
+                e
+            );
+            eprintln!("{}", details);
+            (None, Some(details))
         }
     };
 
@@ -351,7 +422,8 @@ async fn main() {
         .context("failed to initialize Sarvam HTTP client")
         .unwrap();
 
-    let state = Arc::new(Mutex::new(ServerState { decoder, sarvam_client, sarvam_api_key }));
+    let state =
+        Arc::new(Mutex::new(ServerState { decoder, decoder_error, sarvam_client, sarvam_api_key }));
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
@@ -505,13 +577,14 @@ async fn handle_socket(socket: WebSocket, state: Arc<Mutex<ServerState>>) {
                                 }
                             }
                         } else {
-                            eprintln!("[Inference] Decoder not initialized");
-                            InferenceOutput::Error("Backend model not loaded".to_string())
+                            let err = state
+                                .decoder_error
+                                .clone()
+                                .unwrap_or_else(|| "Backend model not loaded".to_string());
+                            eprintln!("[Inference] Decoder not initialized: {}", err);
+                            InferenceOutput::Error(err)
                         };
 
-                        if let Some(decoder) = &mut state.decoder {
-                            decoder.reset_kv_cache();
-                        }
                         Some(output)
                     } else {
                         None

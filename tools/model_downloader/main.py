@@ -24,7 +24,7 @@ def main():
 
     snapshot_download(
         repo_id=repo_id,
-        allow_patterns=["*.json", "*.safetensors"],
+        allow_patterns=["*.json", "*.safetensors", "*.bin", "*.txt"],
         local_dir=local_dir,
     )
 

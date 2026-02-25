@@ -60,3 +60,24 @@ MODEL_NAME=whisper-small docker-compose up --build
 ```
 The system will be accessible via Caddy at `http://localhost`.
 Modify Caddyfile to enable HTTPS and point to the domain.
+
+### Notes for Hugging Face custom Whisper models
+- The backend accepts model weights as either `model.safetensors` or `pytorch_model.bin`.
+- Keep the model directory in the project root and pass its directory name via `MODEL_NAME`.
+- Example:
+```bash
+MODEL_NAME=whisper-large-v2-marathi docker-compose up --build
+```
+
+### Quality tuning (Whisper)
+- Set `CRAFT_VANI_LANGUAGE` to force Whisper language token (example: `mr` for Marathi).
+- Increase `CRAFT_VANI_MIN_DECODE_SECONDS` to give each decode more context (example: `4` or `6`).
+- Set `CRAFT_VANI_OVERLAP_SECONDS` (for example `1`) to keep trailing context between decode windows and improve continuity.
+- Example:
+```bash
+MODEL_NAME=whisper-large-v2-marathi \
+CRAFT_VANI_LANGUAGE=mr \
+CRAFT_VANI_MIN_DECODE_SECONDS=4 \
+CRAFT_VANI_OVERLAP_SECONDS=1 \
+docker-compose up --build
+```

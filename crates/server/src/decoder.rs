@@ -167,15 +167,79 @@ impl Decoder {
             println!("Using quantized tiny-en model (CRAFT_VANI_USE_QUANTIZED=1)");
             (tokenizer, model)
         } else {
-            let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(E::msg)?;
             let config: Config =
                 serde_json::from_reader(std::fs::File::open(dir.join("config.json"))?)?;
-            let weights_path = dir.join("model.safetensors");
-            let vb =
-                unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path], m::DTYPE, device)? };
+            let tokenizer_path = dir.join("tokenizer.json");
+            let tokenizer = if tokenizer_path.exists() {
+                Tokenizer::from_file(&tokenizer_path).map_err(E::msg)?
+            } else {
+                let fallback_paths = [
+                    Path::new("whisper-large-v2").join("tokenizer.json"),
+                    Path::new("whisper-large").join("tokenizer.json"),
+                    Path::new("whisper-small").join("tokenizer.json"),
+                ];
+                let fallback = fallback_paths.iter().find(|p| p.exists()).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "tokenizer.json not found in {} and no fallback tokenizer found",
+                        dir.to_string_lossy()
+                    )
+                })?;
+                println!(
+                    "tokenizer.json missing in {}, using fallback tokenizer {}",
+                    dir.to_string_lossy(),
+                    fallback.to_string_lossy()
+                );
+                Tokenizer::from_file(fallback).map_err(E::msg)?
+            };
+            let safetensors_path = dir.join("model.safetensors");
+            let pth_path = dir.join("pytorch_model.bin");
+            let vb = if safetensors_path.exists() {
+                unsafe {
+                    VarBuilder::from_mmaped_safetensors(&[safetensors_path], m::DTYPE, device)?
+                }
+            } else if pth_path.exists() {
+                VarBuilder::from_pth(pth_path, m::DTYPE, device)?
+            } else {
+                anyhow::bail!(
+                    "no model weights found in {} (expected model.safetensors or pytorch_model.bin)",
+                    dir.to_string_lossy()
+                );
+            };
             let model = Model::Normal(m::model::Whisper::load(&vb, config)?);
-            println!("Using normal safetensors model");
+            println!("Using normal model checkpoint from {}", dir.to_string_lossy());
             (tokenizer, model)
+        };
+
+        let language_token = match std::env::var("CRAFT_VANI_LANGUAGE") {
+            Ok(raw) => {
+                let raw = raw.trim();
+                if raw.is_empty() {
+                    None
+                } else {
+                    let token = if raw.starts_with("<|") && raw.ends_with("|>") {
+                        raw.to_string()
+                    } else {
+                        format!("<|{}|>", raw.to_lowercase())
+                    };
+                    match token_id(&tokenizer, &token) {
+                        Ok(id) => {
+                            println!(
+                                "Using Whisper language token {} from CRAFT_VANI_LANGUAGE",
+                                token
+                            );
+                            Some(id)
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "Invalid CRAFT_VANI_LANGUAGE='{}'. Token {} was not found in tokenizer; continuing without language hint.",
+                                raw, token
+                            );
+                            None
+                        }
+                    }
+                }
+            }
+            Err(_) => None,
         };
 
         let decoder = Self::new(
@@ -184,7 +248,7 @@ impl Decoder {
             mel_filters,
             299792458,
             device,
-            None,
+            language_token,
             Some(Task::Transcribe),
             false, // timestamps
         )?;
